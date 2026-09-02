@@ -1,0 +1,27 @@
+name: Reproducibility checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: r-lib/actions/setup-r@v2
+      - name: Python syntax
+        run: |
+          python -m py_compile \
+            'P01 - Lifetime Risk of SUI & POP Surgery/02 Code/P01_wu_analysis.py' \
+            'P02 - Obliterative vs Reconstructive POP Surgery/02 Code/P02_analysis.py' \
+            'P03 - Sling vs Urethral Bulking Temporal Trends/02 Code/P03_analysis.py' \
+            '04 Logs/build_publication_packages.py'
+      - name: R syntax
+        run: |
+          Rscript -e "files <- c('P01 - Lifetime Risk of SUI & POP Surgery/02 Code/P01_wu_export.R', 'P02 - Obliterative vs Reconstructive POP Surgery/02 Code/P02_server_analysis.R', 'P02 - Obliterative vs Reconstructive POP Surgery/02 Code/P02_P03_disclosure_export.R', 'P03 - Sling vs Urethral Bulking Temporal Trends/02 Code/P03_server_analysis.R'); invisible(lapply(files, parse))"
+      - name: Project contracts and release safety
+        run: python -m unittest discover -s tests -v

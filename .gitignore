@@ -1,0 +1,37 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.Rhistory
+.RData
+.Rproj.user/
+
+# Licensed or derived MarketScan artifacts must never be committed.
+**/03 Data/**
+**/04 Figures/**
+**/05 Manuscript/**
+*.parquet
+*.feather
+*.fst
+*.rds
+*.rda
+*.sas7bdat
+*.xpt
+*.dta
+*.sav
+*.docx
+*.pdf
+*.png
+*.tif
+*.tiff
+*.csv
+
+# Public, non-MarketScan mortality input used by P01.
+!**/nchs2019_female_qx.csv
+
+# Runtime output and transfer areas.
+p01_wu_out/
+p02_aggregate_out/
+p02_transfer_safe/
+p03_aggregate_out/
+p03_transfer_safe/
+duckdb_tmp/
