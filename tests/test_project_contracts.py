@@ -73,15 +73,15 @@ class NumericalMethods(unittest.TestCase):
         age_data = {
             age: {
                 "person_years": 1_000,
-                "sui_operations": 21,
+                "sui_operations": 22,
                 "pop_operations": 31,
                 "both_same_year": 11,
-                "any_operations": 41,
+                "any_operations": 42,
             }
             for age in range(18, 80)
         }
         rows = P01.age_partition_rows(age_data)
-        self.assertEqual(len(rows), 11)
+        self.assertEqual(len(rows), 62)
         for row in rows:
             components = (
                 row["sui_only_operation_person_years"],
@@ -89,6 +89,38 @@ class NumericalMethods(unittest.TestCase):
                 row["both_same_year_operation_person_years"],
             )
             self.assertEqual(sum(components), row["either_operation_person_years"])
+
+    def test_p01_age_partition_merges_only_protected_neighbors(self) -> None:
+        age_data = {
+            age: {
+                "person_years": 1_000,
+                "sui_operations": 22,
+                "pop_operations": 31,
+                "both_same_year": 11,
+                "any_operations": 42,
+            }
+            for age in range(18, 80)
+        }
+        for age in (18, 19):
+            age_data[age] = {
+                "person_years": 1_000,
+                "sui_operations": 26,
+                "pop_operations": 26,
+                "both_same_year": 6,
+                "any_operations": 46,
+            }
+        rows = P01.age_partition_rows(age_data)
+        self.assertEqual(len(rows), 61)
+        self.assertEqual(rows[0]["age_band"], "18-19")
+        self.assertTrue(all(
+            component == 0 or component >= P01.DISCLOSURE_THRESHOLD
+            for row in rows
+            for component in (
+                row["sui_only_operation_person_years"],
+                row["pop_only_operation_person_years"],
+                row["both_same_year_operation_person_years"],
+            )
+        ))
 
 
 class ProjectContracts(unittest.TestCase):
@@ -169,9 +201,9 @@ class ProjectContracts(unittest.TestCase):
         for figure in (
             "Figure3_age_partition.svg",
             "Figure4_deterministic_tornado.svg",
-            "Figure5_wu_comparison_ladder.svg",
         ):
             self.assertIn(figure.lower(), code)
+        self.assertNotIn("figure5_wu_comparison_ladder", code)
 
     def test_builder_is_deterministic_and_does_not_self_feed(self) -> None:
         code = (ROOT / "04 Logs/build_publication_packages.py").read_text()

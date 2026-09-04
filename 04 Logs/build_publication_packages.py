@@ -52,15 +52,11 @@ PAPERS = {
             ),
             (
                 "Figure3_age_partition.svg",
-                "Age-specific either-operation rates partitioned into mutually exclusive SUI-only, POP-only, and same-eligible-woman-year SUI-and-POP components. The overlap category does not establish same-day concomitant surgery; ages 18-29 are combined for disclosure control.",
+                "Age-specific either-operation rates partitioned into mutually exclusive SUI-only, POP-only, and same-eligible-woman-year SUI-and-POP components. Most points represent single-year ages; adjacent ages are pooled only where needed so each displayed component is zero or at least 11. The overlap category does not establish same-day concomitant surgery, and ages 65-68 are shaded to show the commercial-to-Medicare coverage seam.",
             ),
             (
                 "Figure4_deterministic_tornado.svg",
                 "Deterministic one-at-a-time sensitivity analyses for the cumulative risk of either qualifying operation by age 80. The shaded band is the primary sampling 95% confidence interval; the displayed ranges are not a joint uncertainty interval.",
-            ),
-            (
-                "Figure5_wu_comparison_ladder.svg",
-                "Accounting bridge from Wu et al.'s published 20.0% estimate to the current 11.34% estimate. Applying the current recursion and mortality input to Wu's rounded age-band rates yields 18.15%; the resulting like-for-like rate-schedule difference is -6.81 percentage points. This descriptive decomposition does not imply that Wu omitted mortality.",
             ),
         ],
     },

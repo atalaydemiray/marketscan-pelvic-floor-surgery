@@ -39,19 +39,9 @@ ENDPOINTS = {
     "Either": "any_operations",
 }
 WU_BANDS = ((18, 29), (30, 39), (40, 49), (50, 59), (60, 69), (70, 79), (80, 89))
-COMPOSITION_BANDS = (
-    (18, 29),
-    (30, 34),
-    (35, 39),
-    (40, 44),
-    (45, 49),
-    (50, 54),
-    (55, 59),
-    (60, 64),
-    (65, 69),
-    (70, 74),
-    (75, 79),
-)
+DISCLOSURE_THRESHOLD = 11
+COMPOSITION_MIN_AGE = 18
+COMPOSITION_MAX_AGE = 79
 WU_RATES = {
     "SUI": (0.1, 1.7, 3.4, 3.1, 3.3, 3.4, 1.8),
     "POP": (0.2, 1.4, 2.4, 2.8, 3.6, 3.8, 1.7),
@@ -206,31 +196,59 @@ def directly_standardized_annual_rates(
 
 
 def age_partition_rows(age_data: dict[int, dict[str, int]]) -> list[dict[str, str | int]]:
-    """Build disclosure-safe mutually exclusive components of the union rate.
+    """Build a granular, disclosure-safe partition of the union rate.
 
     The supplied phenotype flags are annual. The overlap category therefore
     means SUI and POP were both recorded in the same eligible woman-year; it
-    does not imply that the procedures occurred on the same day.
+    does not imply that the procedures occurred on the same day. Each age is
+    retained separately when all displayed components are zero or at least 11;
+    otherwise adjacent ages are accumulated only until that rule is met.
     """
-    rows: list[dict[str, str | int]] = []
-    for lo, hi in COMPOSITION_BANDS:
-        values: dict[str, int] = defaultdict(int)
-        for age in range(lo, hi + 1):
-            if age not in age_data:
-                raise AssertionError(f"Missing age {age} from P01 age data")
-            for field, value in age_data[age].items():
-                values[field] += value
-        both = values["both_same_year"]
-        sui_only = values["sui_operations"] - both
-        pop_only = values["pop_operations"] - both
-        either = values["any_operations"]
+    bins: list[tuple[int, int, dict[str, int]]] = []
+    start = COMPOSITION_MIN_AGE
+    values: dict[str, int] = defaultdict(int)
+
+    def components(aggregate: dict[str, int]) -> tuple[int, int, int, int]:
+        both = aggregate["both_same_year"]
+        sui_only = aggregate["sui_operations"] - both
+        pop_only = aggregate["pop_operations"] - both
+        either = aggregate["any_operations"]
         if min(sui_only, pop_only, both) < 0 or sui_only + pop_only + both != either:
-            raise AssertionError((lo, hi, sui_only, pop_only, both, either))
-        if any(0 < count < 11 for count in (sui_only, pop_only, both)):
-            raise AssertionError(f"Protected P01 age-partition cell in ages {lo}-{hi}")
+            raise AssertionError((sui_only, pop_only, both, either))
+        return sui_only, pop_only, both, either
+
+    def disclosure_safe(counts: tuple[int, int, int, int]) -> bool:
+        return all(count == 0 or count >= DISCLOSURE_THRESHOLD for count in counts[:3])
+
+    for age in range(COMPOSITION_MIN_AGE, COMPOSITION_MAX_AGE + 1):
+        if age not in age_data:
+            raise AssertionError(f"Missing age {age} from P01 age data")
+        for field, value in age_data[age].items():
+            values[field] += value
+        if disclosure_safe(components(values)):
+            bins.append((start, age, dict(values)))
+            start = age + 1
+            values = defaultdict(int)
+
+    if start <= COMPOSITION_MAX_AGE:
+        if not bins:
+            raise AssertionError("No disclosure-safe P01 age-partition bin could be formed")
+        prior_start, _prior_end, prior_values = bins.pop()
+        for field, value in values.items():
+            prior_values[field] += value
+        if not disclosure_safe(components(prior_values)):
+            raise AssertionError("Final P01 age-partition bin remains below the disclosure threshold")
+        bins.append((prior_start, COMPOSITION_MAX_AGE, prior_values))
+
+    rows: list[dict[str, str | int]] = []
+    for lo, hi, values in bins:
+        sui_only, pop_only, both, either = components(values)
         person_years = values["person_years"]
         rows.append({
-            "age_band": f"{lo}-{hi}",
+            "age_band": str(lo) if lo == hi else f"{lo}-{hi}",
+            "age_start": lo,
+            "age_end": hi,
+            "age_midpoint": f"{(lo + hi) / 2.0:.1f}",
             "person_years": person_years,
             "sui_only_operation_person_years": sui_only,
             "pop_only_operation_person_years": pop_only,
@@ -477,39 +495,6 @@ def make_tables(age_data: dict[int, dict[str, int]], year_age: dict[tuple[int, i
     partition = age_partition_rows(age_data)
     write_rows(DATA / "Figure3_age_partition_data.csv", partition, list(partition[0]))
 
-    either_row = next(row for row in table3 if row["endpoint"] == "Either")
-    wu_published = float(either_row["wu_published_percent"])
-    wu_without_mortality = float(either_row["wu_rates_without_mortality_percent"])
-    wu_harmonized = float(either_row["wu_rates_current_recursion_percent"])
-    current = float(either_row["current_estimate_percent"])
-    ladder_rows = [
-        {
-            "stage": "Wu et al. published estimate",
-            "estimate_percent": f"{wu_published:.2f}",
-            "change_from_prior_points": "",
-            "interpretation": "Published benchmark",
-        },
-        {
-            "stage": "Wu rounded age-band rates, no competing mortality",
-            "estimate_percent": f"{wu_without_mortality:.2f}",
-            "change_from_prior_points": f"{wu_without_mortality - wu_published:+.2f}",
-            "interpretation": "Reconstruction and rounding",
-        },
-        {
-            "stage": "Wu rates under current recursion and mortality input",
-            "estimate_percent": f"{wu_harmonized:.2f}",
-            "change_from_prior_points": f"{wu_harmonized - wu_without_mortality:+.2f}",
-            "interpretation": "Harmonized calculation",
-        },
-        {
-            "stage": "Current 2014-2024 rate schedule",
-            "estimate_percent": f"{current:.2f}",
-            "change_from_prior_points": f"{current - wu_harmonized:+.2f}",
-            "interpretation": "Like-for-like rate-schedule difference",
-        },
-    ]
-    write_rows(DATA / "Figure5_wu_comparison_ladder_data.csv", ladder_rows, list(ladder_rows[0]))
-
     annual: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for (year, _age), values in year_age.items():
         for field, value in values.items():
@@ -630,10 +615,10 @@ def make_figures() -> None:
     save_svg(FIGURES / "Figure2_annual_crude_rates.svg", width, height, parts, "Annual crude pelvic floor operation rates")
 
     partition = read_rows(DATA / "Figure3_age_partition_data.csv")
-    width, height = 1240, 650
+    width, height = 1240, 680
     left, right, top, bottom = 92, 936, 96, 478
-    labels = [row["age_band"] for row in partition]
-    x = lambda index: left + (right - left) * index / (len(labels) - 1)
+    ages = [float(row["age_midpoint"]) for row in partition]
+    x = lambda age: left + (right - left) * (age - COMPOSITION_MIN_AGE) / (COMPOSITION_MAX_AGE - COMPOSITION_MIN_AGE)
     y_max = 4.0
     y = lambda value: bottom - (bottom - top) * value / y_max
     sui_only = [float(row["sui_only_rate_per_1000"]) for row in partition]
@@ -644,13 +629,13 @@ def make_figures() -> None:
     level_3 = [a + b + c for a, b, c in zip(sui_only, pop_only, both)]
 
     def area_polygon(lower: list[float], upper: list[float]) -> str:
-        upper_points = [(x(index), y(value)) for index, value in enumerate(upper)]
-        lower_points = [(x(index), y(value)) for index, value in reversed(list(enumerate(lower)))]
+        upper_points = [(x(age), y(value)) for age, value in zip(ages, upper)]
+        lower_points = [(x(age), y(value)) for age, value in reversed(list(zip(ages, lower)))]
         return " ".join(f"{px:.1f},{py:.1f}" for px, py in upper_points + lower_points)
 
     parts = [
         text(44, 34, "Figure 3. Age-specific operation rate, partitioned by annual outcome", 18, weight=700),
-        text(44, 57, "Mutually exclusive components sum to the either-operation rate", 12, color=GREY),
+        text(44, 57, "Single-year ages retained wherever disclosure-safe; adjacent ages pooled only when required", 12, color=GREY),
     ]
     for tick in (0, 1, 2, 3, 4):
         parts.append(f'<line x1="{left}" y1="{y(tick):.1f}" x2="{right}" y2="{y(tick):.1f}" stroke="{LIGHT}" stroke-width="1"/>')
@@ -660,20 +645,25 @@ def make_figures() -> None:
     parts.append(f'<polygon points="{area_polygon(level_1, level_2)}" fill="{GOLD}" fill-opacity="0.92"/>')
     parts.append(f'<polygon points="{area_polygon(level_2, level_3)}" fill="{PURPLE}" fill-opacity="0.92"/>')
     for boundary in (level_1, level_2):
-        points = " ".join(f"{x(index):.1f},{y(value):.1f}" for index, value in enumerate(boundary))
+        points = " ".join(f"{x(age):.1f},{y(value):.1f}" for age, value in zip(ages, boundary))
         parts.append(f'<polyline points="{points}" fill="none" stroke="#FFFFFF" stroke-width="2.0"/>')
-    envelope = " ".join(f"{x(index):.1f},{y(value):.1f}" for index, value in enumerate(level_3))
+    envelope = " ".join(f"{x(age):.1f},{y(value):.1f}" for age, value in zip(ages, level_3))
     parts.append(f'<polyline points="{envelope}" fill="none" stroke="{INK}" stroke-width="3.0"/>')
-    for index, label in enumerate(labels):
-        parts.append(text(x(index), bottom + 22, label, 9, anchor="middle", color=GREY))
+    seam_left, seam_right = x(65), x(69)
+    parts.append(f'<rect x="{seam_left:.1f}" y="{top}" width="{seam_right-seam_left:.1f}" height="{bottom-top}" fill="#8F3340" fill-opacity="0.08"/>')
+    for boundary in (seam_left, seam_right):
+        parts.append(f'<line x1="{boundary:.1f}" y1="{top}" x2="{boundary:.1f}" y2="{bottom}" stroke="#8F3340" stroke-width="1" stroke-dasharray="4 4"/>')
+    parts.append(text((seam_left + seam_right) / 2, top - 10, "Medicare seam", 10, anchor="middle", color="#8F3340", weight=700))
+    for age in (20, 30, 40, 50, 60, 70, 79):
+        parts.append(text(x(age), bottom + 22, str(age), 9, anchor="middle", color=GREY))
     parts.append(f'<line x1="{left}" y1="{bottom}" x2="{right}" y2="{bottom}" stroke="{INK}" stroke-width="1"/>')
     parts.append(text(22, (top + bottom) / 2, "Operations per 1,000 woman-years", 11, anchor="middle", rotate=-90))
-    parts.append(text((left + right) / 2, bottom + 52, "Age band (years)", 11, anchor="middle", color=GREY))
+    parts.append(text((left + right) / 2, bottom + 52, "Age (years)", 11, anchor="middle", color=GREY))
 
     legend_x = 982
     legend_items = (
         (INK, "Either (envelope)", "all qualifying operation-person-years"),
-        (PURPLE, "Both outcomes in year", "6.2% at 18-29; 34.9% at 75-79"),
+        (PURPLE, "Both outcomes in year", "SUI and POP flags in one eligible woman-year"),
         (GOLD, "POP only", "POP recorded without SUI that year"),
         (BLUE, "SUI only", "SUI recorded without POP that year"),
     )
@@ -683,8 +673,9 @@ def make_figures() -> None:
         parts.append(text(legend_x + 28, legend_y + 1, label, 12, weight=700))
         parts.append(text(legend_x + 28, legend_y + 23, detail, 9, color=GREY))
     parts.append(text(44, 570, "The overlap category means both flags occurred in the same eligible woman-year; it does not establish same-day surgery.", 10, color=GREY))
-    parts.append(text(44, 591, "Ages 18-29 are combined for disclosure control. The 65-69 denominator reflects the commercial-to-Medicare coverage seam.", 10, color=GREY))
-    parts.append(text(44, 612, "Rates are descriptive and are not population incidence rates.", 10, color=GREY))
+    parts.append(text(44, 591, "Most points are single-year ages; protected cells are pooled as 18-19, 20-25, 26-27, 28-29, and 66-67.", 10, color=GREY))
+    parts.append(text(44, 612, "Ages 65-68 are shaded because the commercial-to-Medicare transition creates sparse, selected coverage.", 10, color=GREY))
+    parts.append(text(44, 633, "Rates are descriptive and are not population incidence rates.", 10, color=GREY))
     save_svg(FIGURES / "Figure3_age_partition.svg", width, height, parts, "Age-specific operation rate partitioned by annual outcome")
 
     tornado = read_rows(DATA / "Figure4_deterministic_tornado_data.csv")
@@ -724,52 +715,6 @@ def make_figures() -> None:
     parts.append(text((left + right) / 2, 544, "Estimated cumulative risk to age 80 (%)", 11, anchor="middle", color=GREY))
     parts.append(text(44, 592, "Ranges are deterministic one-at-a-time analyses and do not form a joint uncertainty interval.", 10, color=GREY))
     save_svg(FIGURES / "Figure4_deterministic_tornado.svg", width, height, parts, "Deterministic sensitivity analysis tornado plot")
-
-    ladder = read_rows(DATA / "Figure5_wu_comparison_ladder_data.csv")
-    width, height = 1240, 660
-    left, right, top, bottom = 104, 1136, 100, 434
-    x_positions = (150, 440, 735, 1030)
-    y_min, y_max = 10.0, 21.0
-    y = lambda value: bottom - (bottom - top) * (value - y_min) / (y_max - y_min)
-    colors = (GREY, GREY, GOLD, BLUE)
-    parts = [
-        text(44, 34, "Figure 5. Accounting bridge from Wu et al.'s 20.0% estimate to 11.34%", 18, weight=700),
-        text(44, 57, "Published benchmark, reconstructed inputs, harmonized calculation, and current rate schedule", 12, color=GREY),
-    ]
-    for tick in (10, 12, 14, 16, 18, 20):
-        parts.append(f'<line x1="{left}" y1="{y(tick):.1f}" x2="{right}" y2="{y(tick):.1f}" stroke="{LIGHT}" stroke-width="1"/>')
-        parts.append(text(left - 12, y(tick) + 4, f"{tick}%", 10, anchor="end", color=GREY))
-    values = [float(row["estimate_percent"]) for row in ladder]
-    for index, (row, value, color) in enumerate(zip(ladder, values, colors)):
-        px, py = x_positions[index], y(value)
-        parts.append(f'<line x1="{px-62}" y1="{py:.1f}" x2="{px+62}" y2="{py:.1f}" stroke="{color}" stroke-width="7" stroke-linecap="round"/>')
-        parts.append(f'<circle cx="{px}" cy="{py:.1f}" r="7" fill="{color}" stroke="#FFFFFF" stroke-width="2"/>')
-        parts.append(text(px, py - 17, f"{value:.2f}%", 15, anchor="middle", color=color, weight=700))
-        if index < len(values) - 1:
-            next_x, next_y = x_positions[index + 1], y(values[index + 1])
-            parts.append(f'<line x1="{px+64}" y1="{py:.1f}" x2="{next_x-64}" y2="{next_y:.1f}" stroke="{INK}" stroke-width="2"/>')
-            delta = float(ladder[index + 1]["change_from_prior_points"])
-            delta_color = BLUE if delta < 0 else GREY
-            parts.append(text((px + next_x) / 2, (py + next_y) / 2 - 10, f"{delta:+.2f} points", 11, anchor="middle", color=delta_color, weight=700))
-    stage_lines = (
-        ("Wu et al.", "published estimate", "20.0%"),
-        ("Reconstruct Wu's rounded", "age-band rates without", "competing mortality"),
-        ("Apply current recursion", "and 2019 mortality to", "the same Wu rates"),
-        ("Replace with current", "2014-2024 rate schedule", "using the same recursion"),
-    )
-    for px, lines in zip(x_positions, stage_lines):
-        for line_index, line in enumerate(lines):
-            parts.append(text(px, 468 + line_index * 18, line, 10, anchor="middle", color=INK if line_index == 0 else GREY, weight=700 if line_index == 0 else 400))
-    bracket_y = 540
-    parts.append(f'<line x1="{x_positions[0]}" y1="{bracket_y}" x2="{x_positions[-1]}" y2="{bracket_y}" stroke="{INK}" stroke-width="1.5"/>')
-    parts.append(f'<line x1="{x_positions[0]}" y1="{bracket_y-7}" x2="{x_positions[0]}" y2="{bracket_y+7}" stroke="{INK}" stroke-width="1.5"/>')
-    parts.append(f'<line x1="{x_positions[-1]}" y1="{bracket_y-7}" x2="{x_positions[-1]}" y2="{bracket_y+7}" stroke="{INK}" stroke-width="1.5"/>')
-    parts.append(text((x_positions[0] + x_positions[-1]) / 2, bracket_y - 9, "Published benchmark-to-current gap: -8.66 percentage points", 11, anchor="middle", weight=700))
-    parts.append(text(44, 584, "Wu et al. reported a competing-mortality adjustment. The 20.08%-to-18.15% step harmonizes the rounded published rates", 9, color=GREY))
-    parts.append(text(44, 602, "under our explicit recursion; it is not evidence that Wu omitted mortality. The like-for-like rate-schedule difference is -6.81 points.", 9, color=GREY))
-    parts.append(text(44, 620, "All differences are descriptive; periods, insured populations, coverage, coding, and practice may differ.", 9, color=GREY))
-    save_svg(FIGURES / "Figure5_wu_comparison_ladder.svg", width, height, parts, "Accounting bridge from Wu et al. published estimate to current estimate")
-
 
 def write_summary() -> None:
     totals = [r for r in read_rows(INPUT / "P01_wu_totals.csv") if r["database"] == "Pooled"][0]
