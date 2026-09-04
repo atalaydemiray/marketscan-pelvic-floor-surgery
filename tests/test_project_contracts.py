@@ -69,6 +69,27 @@ class NumericalMethods(unittest.TestCase):
         self.assertLess(lower, ratio)
         self.assertGreater(upper, ratio)
 
+    def test_p01_age_partition_is_mutually_exclusive(self) -> None:
+        age_data = {
+            age: {
+                "person_years": 1_000,
+                "sui_operations": 21,
+                "pop_operations": 31,
+                "both_same_year": 11,
+                "any_operations": 41,
+            }
+            for age in range(18, 80)
+        }
+        rows = P01.age_partition_rows(age_data)
+        self.assertEqual(len(rows), 11)
+        for row in rows:
+            components = (
+                row["sui_only_operation_person_years"],
+                row["pop_only_operation_person_years"],
+                row["both_same_year_operation_person_years"],
+            )
+            self.assertEqual(sum(components), row["either_operation_person_years"])
+
 
 class ProjectContracts(unittest.TestCase):
     def test_public_mortality_input(self) -> None:
@@ -145,6 +166,12 @@ class ProjectContracts(unittest.TestCase):
         code = (ROOT / "P01 - Lifetime Risk of SUI & POP Surgery/02 Code/P01_wu_analysis.py").read_text().lower()
         self.assertNotIn("monte carlo", code)
         self.assertIn("delta-method", code)
+        for figure in (
+            "Figure3_age_partition.svg",
+            "Figure4_deterministic_tornado.svg",
+            "Figure5_wu_comparison_ladder.svg",
+        ):
+            self.assertIn(figure.lower(), code)
 
     def test_builder_is_deterministic_and_does_not_self_feed(self) -> None:
         code = (ROOT / "04 Logs/build_publication_packages.py").read_text()

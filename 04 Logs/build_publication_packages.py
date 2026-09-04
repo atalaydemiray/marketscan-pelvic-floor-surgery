@@ -50,6 +50,18 @@ PAPERS = {
                 "Figure2_annual_crude_rates.svg",
                 "Annual descriptive rates of qualifying SUI, POP, and either operation per 1,000 eligible woman-years, 2014-2024.",
             ),
+            (
+                "Figure3_age_partition.svg",
+                "Age-specific either-operation rates partitioned into mutually exclusive SUI-only, POP-only, and same-eligible-woman-year SUI-and-POP components. The overlap category does not establish same-day concomitant surgery; ages 18-29 are combined for disclosure control.",
+            ),
+            (
+                "Figure4_deterministic_tornado.svg",
+                "Deterministic one-at-a-time sensitivity analyses for the cumulative risk of either qualifying operation by age 80. The shaded band is the primary sampling 95% confidence interval; the displayed ranges are not a joint uncertainty interval.",
+            ),
+            (
+                "Figure5_wu_comparison_ladder.svg",
+                "Accounting bridge from Wu et al.'s published 20.0% estimate to the current 11.34% estimate. Applying the current recursion and mortality input to Wu's rounded age-band rates yields 18.15%; the resulting like-for-like rate-schedule difference is -6.81 percentage points. This descriptive decomposition does not imply that Wu omitted mortality.",
+            ),
         ],
     },
     "P02": {
