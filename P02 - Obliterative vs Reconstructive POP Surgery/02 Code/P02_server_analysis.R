@@ -1,7 +1,7 @@
 # P02 server-side aggregate analysis
 #
-# Governance: Atalay confirmed on 1 September 2026 that this follow-up scope
-# had already been cleared with DataMed/Yujia. Row-level data remain on server.
+# Row-level data remain on the licensed Yale server. Only disclosure-screened
+# aggregate outputs may be transferred.
 
 library(duckdb)
 library(DBI)
@@ -73,18 +73,30 @@ dbExecute(con, sprintf("CREATE OR REPLACE TEMP VIEW surgery_all AS
   UNION ALL
   SELECT 'MDCR' AS database, * FROM %s", se_ccae, se_mdcr))
 
+# Resolve duplicate claim rows and cross-product duplicates before assigning a
+# calendar year. Service-date year, not the source claim YEAR field, defines
+# annual attribution and matches the parent incident flags.
+dbExecute(con, "CREATE OR REPLACE TEMP VIEW surgery_dedup AS
+  SELECT ENROLID, CAST(svcdate AS DATE) AS svcdate,
+         YEAR(CAST(svcdate AS DATE)) AS svc_year,
+         CASE WHEN COUNT(DISTINCT database)=1 THEN MIN(database) ELSE 'BOTH' END AS event_database,
+         list_distinct(flatten(list(codes))) AS codes,
+         MAX(is_pop_surgery) AS is_pop_surgery
+  FROM surgery_all
+  GROUP BY ENROLID, CAST(svcdate AS DATE)")
+
 dbExecute(con, sprintf("CREATE OR REPLACE TEMP VIEW p02_episodes AS
   WITH dates AS (
-    SELECT s.ENROLID, CAST(s.svcdate AS DATE) AS svcdate,
-           MIN(e.study_year) AS study_year, MIN(e.age_at_index) AS age_at_index,
-           MIN(e.age5) AS age5, MIN(e.broad_age) AS broad_age,
-           CASE WHEN COUNT(DISTINCT s.database)=1 THEN MIN(s.database) ELSE 'BOTH' END AS event_database,
+    SELECT s.ENROLID, s.svcdate,
+           e.study_year, e.age_at_index, e.age5, e.broad_age,
+           s.event_database,
            MAX(CASE WHEN %s THEN 1 ELSE 0 END) AS has_obliterative,
            MAX(CASE WHEN %s THEN 1 ELSE 0 END) AS has_reconstructive
-    FROM surgery_all s
+    FROM surgery_dedup s
     INNER JOIN eligible_keys e
-      ON s.ENROLID=e.ENROLID AND CAST(s.YEAR AS INTEGER)=e.study_year
-    GROUP BY s.ENROLID, CAST(s.svcdate AS DATE)
+      ON s.ENROLID=e.ENROLID AND s.svc_year=e.study_year
+    GROUP BY s.ENROLID, s.svcdate, e.study_year, e.age_at_index, e.age5,
+             e.broad_age, s.event_database
     HAVING MAX(CASE WHEN %s THEN 1 ELSE 0 END)=1
   )
   SELECT *,
@@ -99,6 +111,31 @@ dbExecute(con, "CREATE OR REPLACE TEMP VIEW p02_first AS
     FROM p02_episodes
   ) WHERE rn=1")
 
+# Sensitivity: retain the parent's hysterectomy-with-primary-POP-diagnosis
+# channel and classify those additional dates as reconstructive unless an
+# obliterative code is present.
+dbExecute(con, sprintf("CREATE OR REPLACE TEMP VIEW p02_augmented_episodes AS
+  WITH dates AS (
+    SELECT s.ENROLID, s.svcdate, e.study_year, e.age_at_index, e.age5,
+           e.broad_age, s.event_database,
+           MAX(CASE WHEN %s THEN 1 ELSE 0 END) AS has_obliterative,
+           MAX(CASE WHEN %s THEN 1 ELSE 0 END) AS has_reconstructive,
+           MAX(s.is_pop_surgery) AS parent_pop
+    FROM surgery_dedup s INNER JOIN eligible_keys e
+      ON s.ENROLID=e.ENROLID AND s.svc_year=e.study_year
+    GROUP BY s.ENROLID,s.svcdate,e.study_year,e.age_at_index,e.age5,
+             e.broad_age,s.event_database
+    HAVING MAX(CASE WHEN %s THEN 1 ELSE 0 END)=1 OR MAX(s.is_pop_surgery)=1
+  ) SELECT *, CASE WHEN has_obliterative=1 THEN 'Obliterative'
+                   ELSE 'Reconstructive' END AS procedure_group
+    FROM dates", has_any(OBLITERATIVE), has_any(RECONSTRUCTIVE), has_any(QUALIFYING)))
+
+dbExecute(con, "CREATE OR REPLACE TEMP VIEW p02_augmented_first AS
+  SELECT * EXCLUDE(rn) FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY ENROLID ORDER BY svcdate) AS rn
+    FROM p02_augmented_episodes
+  ) WHERE rn=1")
+
 outputs <- list(
   denominators = "SELECT study_year, age5, broad_age, COUNT(*) AS woman_years
                   FROM eligible_rows GROUP BY 1,2,3 ORDER BY 1,2",
@@ -111,6 +148,10 @@ outputs <- list(
   first_by_age = "SELECT age5, procedure_group, COUNT(*) AS women,
                          SUM(mixed_code_date) AS mixed_code_dates
                   FROM p02_first GROUP BY 1,2 ORDER BY 1,2",
+  first_by_age_publication = "SELECT
+      CASE WHEN age_at_index<30 THEN '18-29' ELSE age5 END AS age_publication,
+      procedure_group, COUNT(*) AS women
+    FROM p02_first GROUP BY 1,2 ORDER BY 1,2",
   first_by_year_broad_age = "SELECT study_year, broad_age, procedure_group,
                                     COUNT(*) AS women, SUM(mixed_code_date) AS mixed_code_dates
                              FROM p02_first GROUP BY 1,2,3 ORDER BY 1,2,3",
@@ -140,9 +181,9 @@ for (name in names(outputs)) {
 
 code_sql <- sprintf("WITH expanded AS (
     SELECT s.ENROLID, CAST(s.svcdate AS DATE) AS svcdate, u.code
-    FROM surgery_all s
+    FROM surgery_dedup s
     INNER JOIN eligible_keys e
-      ON s.ENROLID=e.ENROLID AND CAST(s.YEAR AS INTEGER)=e.study_year,
+      ON s.ENROLID=e.ENROLID AND s.svc_year=e.study_year,
     UNNEST(s.codes) AS u(code)
     WHERE u.code IN (%s)
   )
@@ -152,14 +193,42 @@ code_sql <- sprintf("WITH expanded AS (
 write.csv(dbGetQuery(con, code_sql),
           file.path(OUT, "pooled_code_contribution_server_aggregate.csv"), row.names = FALSE)
 
+definition_reconciliation <- sprintf("WITH dates AS (
+    SELECT s.ENROLID,s.svcdate,
+           MAX(s.is_pop_surgery) AS parent_pop,
+           MAX(CASE WHEN %s THEN 1 ELSE 0 END) AS explicit_pop
+    FROM surgery_dedup s INNER JOIN eligible_keys e
+      ON s.ENROLID=e.ENROLID AND s.svc_year=e.study_year
+    GROUP BY s.ENROLID,s.svcdate
+  ) SELECT CASE WHEN parent_pop=1 AND explicit_pop=1 THEN 'Both definitions'
+                WHEN parent_pop=1 THEN 'Parent P01 only'
+                WHEN explicit_pop=1 THEN 'P02 explicit-code only' END AS definition_group,
+           COUNT(*) AS operation_dates, COUNT(DISTINCT ENROLID) AS women
+    FROM dates WHERE parent_pop=1 OR explicit_pop=1 GROUP BY 1 ORDER BY 1",
+  has_any(QUALIFYING))
+write.csv(dbGetQuery(con, definition_reconciliation),
+          file.path(OUT, "pooled_definition_reconciliation_server_aggregate.csv"), row.names = FALSE)
+
+write.csv(dbGetQuery(con, "SELECT 'Current explicit-code definition' AS definition,
+      COUNT(*) AS first_procedures,
+      SUM(CASE WHEN procedure_group='Obliterative' THEN 1 ELSE 0 END) AS obliterative
+    FROM p02_first
+    UNION ALL
+    SELECT 'Augmented with parent hysterectomy channel',COUNT(*),
+      SUM(CASE WHEN procedure_group='Obliterative' THEN 1 ELSE 0 END)
+    FROM p02_augmented_first"),
+  file.path(OUT, "pooled_parent_definition_sensitivity_server_aggregate.csv"), row.names = FALSE)
+
 denominator_total <- dbGetQuery(con, "SELECT COUNT(*) AS n FROM eligible_rows")$n
-stopifnot(denominator_total > 0)
+stopifnot(denominator_total == 47258198)
+stopifnot(dbGetQuery(con, "SELECT COUNT(*) AS n FROM p02_first")$n == 67162)
 
 writeLines(c(
   sprintf("Run time UTC: %s", format(Sys.time(), tz = "UTC")),
-  "P02 server-side aggregation completed within the confirmed follow-up scope.",
-  "First observed procedure was resolved globally across CCAE and MDCR.",
-  sprintf("Pooled person-year denominator is nonzero: %s.", format(denominator_total, big.mark=",", scientific=FALSE)),
+  "P02 server-side aggregation completed.",
+  "First qualifying procedure within an eligible woman-year was resolved globally across CCAE and MDCR.",
+  "Annual attribution used service-date year; the source claim YEAR field was not used for the event join.",
+  "Locked Wu-style pooled person-year denominator check passed: 47,258,198.",
   "Review all cells for disclosure safety before transferring aggregate files."
 ), file.path(OUT, "P02_run_log.txt"))
 

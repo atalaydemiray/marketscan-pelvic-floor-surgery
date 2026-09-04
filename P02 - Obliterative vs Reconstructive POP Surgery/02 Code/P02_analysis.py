@@ -12,9 +12,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PAPER = HERE.parent
-INPUT = PAPER / "03 Data" / "Server Aggregates 2026-09-01"
-OUTPUT = PAPER / "03 Data" / "Analysis 2026-09-02"
-FIGURES = PAPER / "04 Figures" / "Analysis 2026-09-02"
+INPUT = PAPER / "03 Data" / "Server Aggregates 2026-09-04"
+OUTPUT = PAPER / "03 Data" / "Analysis 2026-09-04"
+FIGURES = PAPER / "04 Figures" / "Analysis 2026-09-04"
 OUTPUT.mkdir(parents=True, exist_ok=True)
 FIGURES.mkdir(parents=True, exist_ok=True)
 
@@ -26,7 +26,7 @@ LIGHT = "#DDE4E9"
 PALE = "#F3F6F8"
 PURPLE = "#76548F"
 OLIVE = "#708238"
-AGE_ORDER = ["18-24", "25-29", "30-34", "35-39", "40-44", "45-49", "50-54", "55-59", "60-64", "65-69", "70-74", "75-79", "80-84", "85-89"]
+AGE_ORDER = ["18-29", "30-34", "35-39", "40-44", "45-49", "50-54", "55-59", "60-64", "65-69", "70-74", "75-79", "80-84", "85-89"]
 TEMPORAL_COMPARISONS = ((2014, 2019), (2019, 2020), (2020, 2024), (2014, 2024))
 
 
@@ -47,6 +47,35 @@ def wilson(successes: int, total: int, z: float = 1.959963984540054) -> tuple[fl
     center = (p + z * z / (2 * total)) / den
     half = z * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total)) / den
     return center - half, center + half
+
+
+def newcombe_difference(
+    first_successes: int, first_total: int, second_successes: int, second_total: int
+) -> tuple[float, float, float]:
+    """Newcombe-Wilson interval for two independent proportions (second-first)."""
+    p0 = first_successes / first_total
+    p1 = second_successes / second_total
+    l0, u0 = wilson(first_successes, first_total)
+    l1, u1 = wilson(second_successes, second_total)
+    difference = p1 - p0
+    lower = difference - math.sqrt((p1 - l1) ** 2 + (u0 - p0) ** 2)
+    upper = difference + math.sqrt((u1 - p1) ** 2 + (p0 - l0) ** 2)
+    return difference, lower, upper
+
+
+def risk_ratio_interval(
+    first_successes: int, first_total: int, second_successes: int, second_total: int,
+    z: float = 1.959963984540054,
+) -> tuple[float, float, float]:
+    p0 = first_successes / first_total
+    p1 = second_successes / second_total
+    ratio = p1 / p0
+    standard_error = math.sqrt((1 - p1) / second_successes + (1 - p0) / first_successes)
+    return (
+        ratio,
+        math.exp(math.log(ratio) - z * standard_error),
+        math.exp(math.log(ratio) + z * standard_error),
+    )
 
 
 def write_rows(name: str, rows: list[dict], fields: list[str] | None = None) -> None:
@@ -74,57 +103,48 @@ def make_tables() -> dict[str, float | int]:
     rec = integer(totals["reconstructive"])
     mixed = integer(totals["mixed_code_dates"])
     assert None not in (total, obl, rec, mixed)
+    assert (total, obl, rec, mixed) == (67_162, 3_032, 64_130, 1_148)
     assert obl + rec == total
 
     denominator_rows = read_rows("pooled_denominators.csv")
     total_py = sum(integer(r["woman_years"]) or 0 for r in denominator_rows)
-    assert total_py > 0
+    assert total_py == 47_258_198
     year_py: dict[int, int] = defaultdict(int)
     age_py: dict[str, int] = defaultdict(int)
     for row in denominator_rows:
         n = integer(row["woman_years"])
         assert n is not None
         year_py[int(row["study_year"])] += n
-        age_py[row["age5"]] += n
+        age_group = "18-29" if row["age5"] in {"18-24", "25-29"} else row["age5"]
+        age_py[age_group] += n
 
     overall = []
-    for label, n, share_den in (
-        ("Any qualifying POP procedure", total, total),
-        ("Obliterative", obl, total),
-        ("Reconstructive", rec, total),
-        ("Mixed obliterative/reconstructive code date", mixed, total),
+    for label, n, show_interval in (
+        ("Any qualifying POP procedure", total, False),
+        ("Obliterative", obl, True),
+        ("Reconstructive", rec, True),
+        ("Of which: mixed obliterative/reconstructive code date", mixed, True),
     ):
-        lo_share, hi_share = wilson(n, share_den)
-        lo_rate, hi_rate = wilson(n, total_py)
+        lo_share, hi_share = wilson(n, total) if show_interval else (math.nan, math.nan)
         overall.append({
             "measure": label,
             "count": n,
-            "share_percent": f"{100 * n / share_den:.2f}",
-            "share_ci95_lower_percent": f"{100 * lo_share:.2f}",
-            "share_ci95_upper_percent": f"{100 * hi_share:.2f}",
+            "share_percent": "Not applicable" if not show_interval else f"{100 * n / total:.2f}",
+            "share_ci95_lower_percent": "Not applicable" if not show_interval else f"{100 * lo_share:.2f}",
+            "share_ci95_upper_percent": "Not applicable" if not show_interval else f"{100 * hi_share:.2f}",
             "rate_per_1000_woman_years": f"{rate(n, total_py):.3f}",
-            "rate_ci95_lower_per_1000": f"{1000 * lo_rate:.3f}",
-            "rate_ci95_upper_per_1000": f"{1000 * hi_rate:.3f}",
         })
     write_rows("Table1_overall_summary.csv", overall)
 
     age_cells: dict[tuple[str, str], dict[str, str]] = {}
-    for row in read_rows("pooled_first_by_age.csv"):
-        age_cells[(row["age5"], row["procedure_group"])] = row
+    for row in read_rows("pooled_first_by_age_publication.csv"):
+        age_cells[(row["age_publication"], row["procedure_group"])] = row
     age_table = []
     for age in AGE_ORDER:
         o = integer(age_cells[(age, "Obliterative")]["women"])
         r = integer(age_cells[(age, "Reconstructive")]["women"])
         py = age_py[age]
-        if o is None or r is None:
-            age_table.append({
-                "age_group": age, "woman_years": py, "obliterative": "SUPPRESSED",
-                "reconstructive": r if r is not None else "SUPPRESSED", "total_first_observed": "SUPPRESSED",
-                "obliterative_share_percent": "SUPPRESSED", "share_ci95_lower_percent": "SUPPRESSED",
-                "share_ci95_upper_percent": "SUPPRESSED", "obliterative_rate_per_1000": "SUPPRESSED",
-                "reconstructive_rate_per_1000": f"{rate(r, py):.3f}" if r is not None else "SUPPRESSED",
-            })
-            continue
+        assert o is not None and r is not None
         n = o + r
         lo, hi = wilson(o, n)
         age_table.append({
@@ -139,17 +159,56 @@ def make_tables() -> dict[str, float | int]:
     year_cells: dict[tuple[int, str], dict[str, str]] = {}
     for row in read_rows("pooled_first_by_year.csv"):
         year_cells[(int(row["study_year"]), row["procedure_group"])] = row
+    broad_cells = {
+        (int(row["study_year"]), row["broad_age"], row["procedure_group"]): integer(row["women"])
+        for row in read_rows("pooled_first_by_year_broad_age.csv")
+    }
+    broad_order = ("<65", "65-74", "75-84", "85-89")
+    broad_totals = {
+        age: sum(
+            broad_cells[(year, age, group)] or 0
+            for year in sorted(year_py) for group in ("Obliterative", "Reconstructive")
+        )
+        for age in broad_order
+    }
+    standard_total = sum(broad_totals.values())
+    standard_weights = {age: broad_totals[age] / standard_total for age in broad_order}
+
     annual = []
+    standardized_share_by_year: dict[int, float] = {}
     for year in sorted(year_py):
         o = integer(year_cells[(year, "Obliterative")]["women"])
         r = integer(year_cells[(year, "Reconstructive")]["women"])
         assert o is not None and r is not None
         n, py = o + r, year_py[year]
         lo, hi = wilson(o, n)
+        standardized_share = sum(
+            standard_weights[age] * (broad_cells[(year, age, "Obliterative")] or 0) /
+            ((broad_cells[(year, age, "Obliterative")] or 0) +
+             (broad_cells[(year, age, "Reconstructive")] or 0))
+            for age in broad_order
+        )
+        standardized_share_by_year[year] = standardized_share
+        standardized_variance = sum(
+            standard_weights[age] ** 2 *
+            ((broad_cells[(year, age, "Obliterative")] or 0) /
+             ((broad_cells[(year, age, "Obliterative")] or 0) +
+              (broad_cells[(year, age, "Reconstructive")] or 0))) *
+            (1 - (broad_cells[(year, age, "Obliterative")] or 0) /
+             ((broad_cells[(year, age, "Obliterative")] or 0) +
+              (broad_cells[(year, age, "Reconstructive")] or 0))) /
+            ((broad_cells[(year, age, "Obliterative")] or 0) +
+             (broad_cells[(year, age, "Reconstructive")] or 0))
+            for age in broad_order
+        )
+        std_se = math.sqrt(standardized_variance)
         annual.append({
             "study_year": year, "woman_years": py, "obliterative": o, "reconstructive": r,
             "total_first_observed": n, "obliterative_share_percent": f"{100 * o / n:.2f}",
             "share_ci95_lower_percent": f"{100 * lo:.2f}", "share_ci95_upper_percent": f"{100 * hi:.2f}",
+            "age_standardized_obliterative_share_percent": f"{100 * standardized_share:.2f}",
+            "age_standardized_ci95_lower_percent": f"{100 * max(0.0, standardized_share - 1.959963984540054 * std_se):.2f}",
+            "age_standardized_ci95_upper_percent": f"{100 * min(1.0, standardized_share + 1.959963984540054 * std_se):.2f}",
             "obliterative_rate_per_1000": f"{rate(o, py):.3f}",
             "reconstructive_rate_per_1000": f"{rate(r, py):.3f}",
             "total_rate_per_1000": f"{rate(n, py):.3f}",
@@ -160,16 +219,32 @@ def make_tables() -> dict[str, float | int]:
     temporal = []
     for start_year, end_year in TEMPORAL_COMPARISONS:
         start, end = annual_lookup[start_year], annual_lookup[end_year]
-        start_share = float(start["obliterative_share_percent"])
-        end_share = float(end["obliterative_share_percent"])
+        start_o, start_r = int(start["obliterative"]), int(start["reconstructive"])
+        end_o, end_r = int(end["obliterative"]), int(end["reconstructive"])
+        start_share = start_o / (start_o + start_r)
+        end_share = end_o / (end_o + end_r)
+        difference, diff_lower, diff_upper = newcombe_difference(
+            start_o, start_o + start_r, end_o, end_o + end_r
+        )
+        ratio, ratio_lower, ratio_upper = risk_ratio_interval(
+            start_o, start_o + start_r, end_o, end_o + end_r
+        )
         temporal.append({
             "comparison": f"{start_year}-{end_year}",
             "start_year": start_year,
             "end_year": end_year,
-            "start_obliterative_share_percent": f"{start_share:.2f}",
-            "end_obliterative_share_percent": f"{end_share:.2f}",
-            "absolute_change_percentage_points": f"{end_share - start_share:.2f}",
-            "relative_change_percent": f"{100 * (end_share / start_share - 1):.1f}",
+            "start_obliterative_share_percent": f"{100 * start_share:.2f}",
+            "end_obliterative_share_percent": f"{100 * end_share:.2f}",
+            "absolute_change_percentage_points": f"{100 * difference:.2f}",
+            "absolute_change_ci95_lower_points": f"{100 * diff_lower:.2f}",
+            "absolute_change_ci95_upper_points": f"{100 * diff_upper:.2f}",
+            "share_ratio": f"{ratio:.2f}",
+            "share_ratio_ci95_lower": f"{ratio_lower:.2f}",
+            "share_ratio_ci95_upper": f"{ratio_upper:.2f}",
+            "relative_change_percent": f"{100 * (ratio - 1):.1f}",
+            "start_age_standardized_share_percent": start["age_standardized_obliterative_share_percent"],
+            "end_age_standardized_share_percent": end["age_standardized_obliterative_share_percent"],
+            "age_standardized_change_points": f"{100 * (standardized_share_by_year[end_year] - standardized_share_by_year[start_year]):.2f}",
             "start_obliterative_rate_per_1000": start["obliterative_rate_per_1000"],
             "end_obliterative_rate_per_1000": end["obliterative_rate_per_1000"],
             "start_reconstructive_rate_per_1000": start["reconstructive_rate_per_1000"],
@@ -180,7 +255,7 @@ def make_tables() -> dict[str, float | int]:
     write_rows("Table4_temporal_change_summary.csv", temporal)
 
     burden_cells: dict[tuple[int, str], dict[str, str]] = {}
-    for row in read_rows("pooled_total_burden_by_year.csv"):
+    for row in read_rows("pooled_eligible_year_procedure_dates_by_year.csv"):
         burden_cells[(int(row["study_year"]), row["procedure_group"])] = row
     burden = []
     for year in sorted(year_py):
@@ -194,7 +269,7 @@ def make_tables() -> dict[str, float | int]:
             "reconstructive_rate_per_1000": f"{rate(r, year_py[year]):.3f}",
             "all_rate_per_1000": f"{rate(o + r, year_py[year]):.3f}",
         })
-    write_rows("Table5_total_procedure_burden.csv", burden)
+    write_rows("Table5_eligible_year_procedure_dates.csv", burden)
 
     codes = []
     obl_codes = {"57106", "57110", "57120", "58275", "58280"}
@@ -202,14 +277,29 @@ def make_tables() -> dict[str, float | int]:
         codes.append({
             "cpt": row["code"],
             "classification": "Obliterative" if row["code"] in obl_codes else "Reconstructive",
-            "claim_rows": row["claim_rows"],
             "operation_dates": row["operation_dates"],
             "suppressed": row["operation_dates_suppressed"],
         })
     write_rows("Table6_code_contribution.csv", codes)
 
-    broad = {(r["broad_age"], r["procedure_group"]): integer(r["women"])
-             for r in read_rows("pooled_first_by_broad_age.csv")}
+    definition_rows = read_rows("pooled_definition_reconciliation.csv")
+    write_rows("Table7_parent_definition_reconciliation.csv", definition_rows)
+    sensitivity_rows = []
+    for row in read_rows("pooled_parent_definition_sensitivity.csv"):
+        first = integer(row["first_procedures"])
+        obliterative = integer(row["obliterative"])
+        assert first is not None and obliterative is not None
+        sensitivity_rows.append({
+            **row,
+            "obliterative_share_percent": f"{100 * obliterative / first:.2f}",
+        })
+    write_rows("Table8_parent_definition_sensitivity.csv", sensitivity_rows)
+
+    broad = {
+        (age, group): sum(
+            broad_cells[(year, age, group)] or 0 for year in sorted(year_py)
+        ) for age in broad_order for group in ("Obliterative", "Reconstructive")
+    }
     broad_shares = {}
     for age in ("<65", "65-74", "75-84", "85-89"):
         o, r = broad[(age, "Obliterative")], broad[(age, "Reconstructive")]
@@ -225,6 +315,8 @@ def make_tables() -> dict[str, float | int]:
         "first_last_pp": last_year_share - first_year_share,
         "first_last_relative": 100 * (last_year_share / first_year_share - 1),
         "broad_75_84": broad_shares["75-84"], "broad_85_89": broad_shares["85-89"],
+        "first_year_standardized": float(annual[0]["age_standardized_obliterative_share_percent"]),
+        "last_year_standardized": float(annual[-1]["age_standardized_obliterative_share_percent"]),
     }
     return metrics
 
@@ -253,7 +345,7 @@ def make_figures() -> None:
     xstep = (right - left) / len(age)
     y = lambda v: bottom - (bottom - top) * v / y_max
     parts = [
-        svg_text(42, 34, "Figure 1. Obliterative share of first observed POP procedures by age", 18, weight=700),
+        svg_text(42, 34, "Figure 1. Obliterative share of eligible-year POP procedures by age", 18, weight=700),
         svg_text(42, 58, "Pooled CCAE and MDCR, 2014-2024; Wilson 95% confidence intervals", 12, color=GREY),
     ]
     for tick in range(0, 51, 10):
@@ -276,7 +368,7 @@ def make_figures() -> None:
         parts.append(f'<line x1="{cx-4:.1f}" y1="{y(hi):.1f}" x2="{cx+4:.1f}" y2="{y(hi):.1f}" stroke="{INK}"/>')
     parts.append(f'<line x1="{left}" y1="{bottom}" x2="{right}" y2="{bottom}" stroke="{INK}"/>')
     parts.append(svg_text(22, (top + bottom) / 2, "Obliterative share (%)", 11, anchor="middle", rotate=-90))
-    parts.append(svg_text(width / 2, 516, "S = exact count suppressed because the cell contained fewer than 11 women.", 10, anchor="middle", color=GREY))
+    parts.append(svg_text(width / 2, 516, "Ages 18-24 and 25-29 are combined to protect the smaller cell.", 10, anchor="middle", color=GREY))
     save_svg("Figure1_obliterative_share_by_age.svg", width, height, parts, "Obliterative share by age")
 
     with (OUTPUT / "Table3_annual_first_procedure.csv").open(newline="") as handle:
@@ -284,7 +376,7 @@ def make_figures() -> None:
     years = [int(r["study_year"]) for r in annual]
     width, height = 1120, 520
     parts = [
-        svg_text(42, 34, "Figure 2. Annual first observed obliterative and reconstructive POP procedures", 18, weight=700),
+        svg_text(42, 34, "Figure 2. Annual eligible-year obliterative and reconstructive POP procedures", 18, weight=700),
         svg_text(42, 58, "Panel A: obliterative share; Panel B: crude rates per 1,000 eligible woman-years", 12, color=GREY),
     ]
     panels = [(70, 520), (620, 1070)]
@@ -297,10 +389,15 @@ def make_figures() -> None:
         parts.append(f'<line x1="{l}" y1="{y1(tick):.1f}" x2="{r}" y2="{y1(tick):.1f}" stroke="{LIGHT}"/>')
         parts.append(svg_text(l - 8, y1(tick) + 4, str(tick), 9, anchor="end", color=GREY))
     vals = [float(row["obliterative_share_percent"]) for row in annual]
+    standardized_vals = [float(row["age_standardized_obliterative_share_percent"]) for row in annual]
     points = " ".join(f'{x(yv,l,r):.1f},{y1(v):.1f}' for yv, v in zip(years, vals))
     parts.append(f'<polyline points="{points}" fill="none" stroke="{GOLD}" stroke-width="2.6"/>')
     for yr, val in zip(years, vals):
         parts.append(f'<circle cx="{x(yr,l,r):.1f}" cy="{y1(val):.1f}" r="4" fill="{GOLD}" stroke="#FFF"/>')
+    standardized_points = " ".join(
+        f'{x(yv,l,r):.1f},{y1(v):.1f}' for yv, v in zip(years, standardized_vals)
+    )
+    parts.append(f'<polyline points="{standardized_points}" fill="none" stroke="{PURPLE}" stroke-width="2.2" stroke-dasharray="6 4"/>')
     parts.append(svg_text((l + r) / 2, 88, "A. Obliterative share (%)", 13, anchor="middle", weight=700))
     # Panel B
     l2, r2 = panels[1]
@@ -320,6 +417,10 @@ def make_figures() -> None:
         parts.append(f'<line x1="{panel_l}" y1="{bottom}" x2="{panel_r}" y2="{bottom}" stroke="{INK}"/>')
         for yr in years:
             parts.append(svg_text(x(yr, panel_l, panel_r), bottom + 20, str(yr), 8, anchor="middle", color=GREY))
+    parts.append(f'<line x1="150" y1="462" x2="178" y2="462" stroke="{GOLD}" stroke-width="2.6"/>')
+    parts.append(svg_text(186, 466, "Crude share", 10, color=GREY))
+    parts.append(f'<line x1="280" y1="462" x2="308" y2="462" stroke="{PURPLE}" stroke-width="2.2" stroke-dasharray="6 4"/>')
+    parts.append(svg_text(316, 466, "Age-standardized share", 10, color=GREY))
     parts.append(f'<line x1="720" y1="462" x2="748" y2="462" stroke="{BLUE}" stroke-width="2.5"/>')
     parts.append(svg_text(756, 466, "Reconstructive", 10, color=GREY))
     parts.append(f'<line x1="860" y1="462" x2="888" y2="462" stroke="{GOLD}" stroke-width="2.5"/>')
@@ -348,7 +449,7 @@ def make_figures() -> None:
     y3 = lambda value: bottom - (bottom - top) * value / y_max
     parts = [
         svg_text(42, 34, "Figure 3. Annual obliterative share by age group", 18, weight=700),
-        svg_text(42, 58, "First observed qualifying POP procedures, 2014-2024; descriptive shares", 12, color=GREY),
+        svg_text(42, 58, "First qualifying procedure per enrollee occurring in an eligible woman-year", 12, color=GREY),
     ]
     for tick in range(0, 61, 10):
         parts.append(f'<line x1="{left}" y1="{y3(tick):.1f}" x2="{right}" y2="{y3(tick):.1f}" stroke="{LIGHT}"/>')
@@ -385,18 +486,19 @@ def make_figures() -> None:
 def write_summary(m: dict[str, float | int]) -> None:
     lines = [
         "P02 analysis summary",
-        "Run date: 2026-09-02",
+        "Run date: 2026-09-04",
         "",
         f"Eligible woman-years: {m['total_py']:,}",
-        f"Women with a first observed qualifying POP procedure: {m['total']:,}",
+        f"Enrollees with a first qualifying explicit-code POP procedure occurring in an eligible woman-year: {m['total']:,}",
         f"Obliterative: {m['obl']:,} ({100*m['overall_share']:.2f}%)",
         f"Reconstructive: {m['rec']:,} ({100*(1-m['overall_share']):.2f}%)",
         f"Mixed-code dates classified as obliterative: {m['mixed']:,} ({100*m['mixed_share_all']:.2f}% of all first procedures; {100*m['mixed_share_obl']:.1f}% of obliterative-classified first procedures)",
         f"Obliterative share: {m['first_year_share']:.2f}% in 2014 and {m['last_year_share']:.2f}% in 2024; absolute change {m['first_last_pp']:.2f} percentage points and relative change {m['first_last_relative']:.1f}%.",
+        f"Directly age-standardized obliterative share: {m['first_year_standardized']:.2f}% in 2014 and {m['last_year_standardized']:.2f}% in 2024.",
         f"Obliterative share by broad age: {100*m['broad_75_84']:.2f}% at 75-84 and {100*m['broad_85_89']:.2f}% at 85-89",
         "",
-        "All results are descriptive. First observed procedures were resolved across the combined CCAE/MDCR history.",
-        "Cells below 11 remain suppressed and were not reconstructed.",
+        "All results are descriptive. Person-level resolution occurred after unioning CCAE and MDCR records.",
+        "Nonzero cells below 11 were removed from the transfer set; redundant margins were excluded or ages were collapsed so protected cells are not recoverable by subtraction.",
     ]
     (OUTPUT / "P02_analysis_summary.txt").write_text("\n".join(lines) + "\n")
 

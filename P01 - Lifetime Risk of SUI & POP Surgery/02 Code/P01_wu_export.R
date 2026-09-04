@@ -122,11 +122,12 @@ pooled <- data.frame(
 )
 write.csv(rbind(totals, pooled), file.path(OUT, "P01_wu_totals.csv"), row.names = FALSE)
 
-# Structural reconciliation. Study-specific expected totals are kept in the
-# governed internal validation record, not in the external code repository.
-stopifnot(pooled$person_years > 0)
-stopifnot(pooled$any_operations >= pooled$unique_operated_women)
+# Locked reconciliation for this rerun.
+stopifnot(pooled$person_years == 47258198)
+stopifnot(pooled$any_operations == 102440)
 stopifnot(pooled_distinct$duplicate_woman_years == 0)
+stopifnot(pooled$unique_operated_women == 102107)
+stopifnot(pooled$any_operations - pooled$unique_operated_women == 333)
 
 writeLines(c(
   sprintf("Run time UTC: %s", format(Sys.time(), tz = "UTC")),
@@ -134,7 +135,7 @@ writeLines(c(
   sprintf("Qualifying operation-person-years: %s", format(pooled$any_operations, big.mark = ",", scientific = FALSE)),
   sprintf("Unique operated women: %s", format(pooled$unique_operated_women, big.mark = ",", scientific = FALSE)),
   sprintf("Repeat qualifying woman-years: %s", pooled$any_operations - pooled$unique_operated_women),
-  "All structural count checks passed."
+  "All locked count checks passed."
 ), file.path(OUT, "P01_wu_run_log.txt"))
 
 dbDisconnect(con, shutdown = TRUE)

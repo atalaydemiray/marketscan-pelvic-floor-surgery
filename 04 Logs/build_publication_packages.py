@@ -8,31 +8,38 @@ PNG and TIFF exports are tightly cropped, RGB, and tagged at 300 dpi.
 
 from __future__ import annotations
 
-import argparse
 import hashlib
+import os
+import signal
 import shutil
+import subprocess
+import tempfile
+import time
 from pathlib import Path
 
 from PIL import Image, ImageChops
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DATE = "2026-09-02"
+DATE = "2026-09-04"
 TARGET_WIDTH = 2400
 TARGET_DPI = (300, 300)
 
 PAPERS = {
     "P01": {
         "paper": ROOT / "P01 - Lifetime Risk of SUI & POP Surgery",
-        "data_source": "Wu Comparable 2026-09-01",
-        "figure_source": "Wu Comparable 2026-09-01",
+        "data_source": "Analysis 2026-09-04",
+        "figure_source": "Analysis 2026-09-04",
         "main_tables": [
             "Table1_cohort_by_age.csv",
             "Table2_age_specific_rates.csv",
             "Table3_lifetime_risk.csv",
         ],
         "supplementary_tables": [
-            ("Table4_annual_crude_rates.csv", "Supplementary_Table_S1_annual_crude_rates.csv"),
+            ("Table4_annual_crude_rates.csv", "Supplementary_Table_S1_annual_crude_and_standardized_rates.csv"),
+            ("Table5_period_specific_cumulative_risk.csv", "Supplementary_Table_S2_period_specific_cumulative_risk.csv"),
+            ("Table6_deterministic_sensitivity_analysis.csv", "Supplementary_Table_S3_deterministic_sensitivity.csv"),
+            ("Table7_washout_sensitivity.csv", "Supplementary_Table_S4_washout_sensitivity.csv"),
         ],
         "figures": [
             (
@@ -47,8 +54,8 @@ PAPERS = {
     },
     "P02": {
         "paper": ROOT / "P02 - Obliterative vs Reconstructive POP Surgery",
-        "data_source": "Analysis 2026-09-02",
-        "figure_source": "Analysis 2026-09-02",
+        "data_source": "Analysis 2026-09-04",
+        "figure_source": "Analysis 2026-09-04",
         "main_tables": [
             "Table1_overall_summary.csv",
             "Table2_first_procedure_by_age.csv",
@@ -56,13 +63,15 @@ PAPERS = {
             "Table4_temporal_change_summary.csv",
         ],
         "supplementary_tables": [
-            ("Table5_total_procedure_burden.csv", "Supplementary_Table_S1_total_procedure_burden.csv"),
+            ("Table5_eligible_year_procedure_dates.csv", "Supplementary_Table_S1_eligible_year_procedure_dates.csv"),
             ("Table6_code_contribution.csv", "Supplementary_Table_S2_code_contribution.csv"),
+            ("Table7_parent_definition_reconciliation.csv", "Supplementary_Table_S3_parent_definition_reconciliation.csv"),
+            ("Table8_parent_definition_sensitivity.csv", "Supplementary_Table_S4_parent_definition_sensitivity.csv"),
         ],
         "figures": [
             (
                 "Figure1_obliterative_share_by_age.svg",
-                "Obliterative share of first observed qualifying POP procedures by 5-year age group, with Wilson 95% confidence intervals.",
+                "Obliterative share of the first qualifying POP procedure per enrollee occurring in an eligible woman-year, with Wilson 95% confidence intervals.",
             ),
             (
                 "Figure2_annual_share_and_rates.svg",
@@ -70,41 +79,42 @@ PAPERS = {
             ),
             (
                 "Figure3_annual_obliterative_share_by_age.svg",
-                "Annual obliterative share among first observed qualifying POP procedures in four reportable broad age groups; values are descriptive.",
+                "Annual obliterative share among eligible-year first qualifying POP procedures in four broad age groups; values are descriptive.",
             ),
         ],
     },
     "P03": {
         "paper": ROOT / "P03 - Sling vs Urethral Bulking Temporal Trends",
-        "data_source": "Analysis 2026-09-02",
-        "figure_source": "Analysis 2026-09-02",
+        "data_source": "Analysis 2026-09-04",
+        "figure_source": "Analysis 2026-09-04",
         "main_tables": [
-            "Table1_overall_first_observed.csv",
+            "Table1_first_qualifying_procedure_in_eligible_year.csv",
             "Table2_period_comparison.csv",
-            "Table3_annual_first_observed_isolated.csv",
+            "Table3_annual_eligible_year_isolated.csv",
             "Table4_age_period_isolated.csv",
             "Table5_temporal_change_summary.csv",
         ],
         "supplementary_tables": [
-            ("Table6_total_burden_90_vs_180_days.csv", "Supplementary_Table_S1_bulking_course_sensitivity.csv"),
-            ("Table7_annual_total_burden_90_day_isolated.csv", "Supplementary_Table_S2_annual_90_day_burden.csv"),
+            ("Table6_all_period_burden_90_vs_180_days.csv", "Supplementary_Table_S1_bulking_course_sensitivity.csv"),
+            ("Table7_annual_all_period_burden_90_day_isolated.csv", "Supplementary_Table_S2_annual_90_day_burden.csv"),
+            ("Table8_first_procedure_scope_sensitivity.csv", "Supplementary_Table_S3_first_procedure_scope_sensitivity.csv"),
         ],
         "figures": [
             (
                 "Figure1_annual_bulking_share.svg",
-                "Annual bulking share among first observed isolated-SUI sling or bulking procedures; hybrid procedures are excluded and 2020 is descriptive.",
+                "Annual bulking share among eligible-year first qualifying isolated-SUI sling or bulking procedures; hybrid procedures are excluded and 2020 is descriptive.",
             ),
             (
                 "Figure2_annual_first_procedure_rates.svg",
-                "Annual crude rates of first observed isolated-SUI sling and urethral bulking procedures per 1,000 eligible woman-years.",
+                "Annual crude rates of eligible-year first qualifying isolated-SUI sling and urethral bulking procedures per 1,000 eligible woman-years.",
             ),
             (
                 "Figure3_age_period_bulking_share.svg",
-                "Bulking share among first observed isolated-SUI sling or bulking procedures in 2014-2019 versus 2020-2024 by 5-year age group.",
+                "Bulking share among eligible-year isolated-SUI procedures in 2014-2019 versus 2020-2024; ages 18-29 are combined and older ages use 5-year groups.",
             ),
             (
                 "Figure4_first_vs_burden_bulking_share.svg",
-                "Annual bulking shares for first observed isolated-SUI procedures and total procedure burden using 90-day bulking courses; 2020 is descriptive.",
+                "Annual bulking shares for eligible-year first procedures and all-period treatment burden using 90-day bulking courses; 2020 is descriptive.",
             ),
         ],
     },
@@ -123,8 +133,76 @@ def flattened_rgb(path: Path) -> Image.Image:
     return background.convert("RGB")
 
 
+def chrome_binary() -> Path:
+    candidates = [
+        os.environ.get("CHROME_BIN"),
+        shutil.which("google-chrome"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return Path(candidate)
+    raise FileNotFoundError("A Chrome/Chromium executable is required for deterministic SVG rasterization")
+
+
+def render_svg(source: Path) -> Image.Image:
+    """Render SVG with a fixed headless-browser viewport into a temporary PNG."""
+    with tempfile.TemporaryDirectory(prefix="marketscan-svg-") as temp_directory:
+        png = Path(temp_directory) / "render.png"
+        profile = Path(temp_directory) / "chrome-profile"
+        command = [
+            str(chrome_binary()),
+            "--headless=new",
+            "--disable-gpu",
+            "--no-sandbox",
+            "--hide-scrollbars",
+            "--disable-background-networking",
+            "--run-all-compositor-stages-before-draw",
+            "--virtual-time-budget=1000",
+            "--force-device-scale-factor=2",
+            "--window-size=1400,1100",
+            f"--user-data-dir={profile}",
+            f"--screenshot={png}",
+            source.resolve().as_uri(),
+        ]
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 30
+        last_size = -1
+        stable_checks = 0
+        while time.monotonic() < deadline:
+            if png.exists() and png.stat().st_size > 0:
+                current_size = png.stat().st_size
+                stable_checks = stable_checks + 1 if current_size == last_size else 0
+                last_size = current_size
+                if stable_checks >= 3:
+                    break
+            if process.poll() is not None and not png.exists():
+                break
+            time.sleep(0.1)
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            _stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            _stdout, stderr = process.communicate()
+        if not png.exists() or png.stat().st_size == 0:
+            raise RuntimeError(f"SVG rendering failed for {source}: {stderr.strip()}")
+        image = flattened_rgb(png)
+        image.load()
+        return image
+
+
 def publication_raster(source: Path) -> Image.Image:
-    image = flattened_rgb(source)
+    image = render_svg(source)
     white = Image.new("RGB", image.size, "white")
     bbox = ImageChops.difference(image, white).getbbox()
     if bbox is None:
@@ -139,7 +217,7 @@ def publication_raster(source: Path) -> Image.Image:
     return cropped.resize((TARGET_WIDTH, target_height), Image.Resampling.LANCZOS)
 
 
-def build_paper(code: str, spec: dict, thumbnail_dir: Path | None) -> list[str]:
+def build_paper(code: str, spec: dict) -> list[str]:
     paper: Path = spec["paper"]
     data_source = paper / "03 Data" / spec["data_source"]
     figure_source = paper / "04 Figures" / spec["figure_source"]
@@ -185,7 +263,7 @@ def build_paper(code: str, spec: dict, thumbnail_dir: Path | None) -> list[str]:
         "## Notes",
         "",
         "- Counts and denominators retain the estimand labels used in the manuscript.",
-        "- SUPPRESSED cells remain suppressed and were not reconstructed.",
+        "- Nonzero counts below 11 remain masked; redundant margins were excluded or age groups were collapsed to prevent recovery by subtraction.",
         "- Exact journal styling can be applied after the target journal is selected.",
         "",
     ])
@@ -204,21 +282,12 @@ def build_paper(code: str, spec: dict, thumbnail_dir: Path | None) -> list[str]:
         svg_target = figure_output / svg_name
         shutil.copy2(svg_source, svg_target)
 
-        rendered_candidate = thumbnail_dir / f"{svg_name}.png" if thumbnail_dir is not None else None
-        if rendered_candidate is not None and rendered_candidate.exists():
-            raster_source = rendered_candidate
-        else:
-            raster_source = figure_source / f"{Path(svg_name).stem}.png"
-        if not raster_source.exists():
-            raise FileNotFoundError(f"Missing rendered SVG preview: {raster_source}")
-
-        image = publication_raster(raster_source)
+        image = publication_raster(svg_source)
         stem = Path(svg_name).stem
         png_target = figure_output / f"{stem}.png"
         tif_target = figure_output / f"{stem}.tif"
         image.save(png_target, format="PNG", dpi=TARGET_DPI, optimize=True)
         image.save(tif_target, format="TIFF", dpi=TARGET_DPI, compression="tiff_lzw")
-        image.save(figure_source / f"{stem}.png", format="PNG", dpi=TARGET_DPI, optimize=True)
 
         legend_lines.extend([f"## Figure {index}", "", legend, ""])
         lines.append(
@@ -232,22 +301,6 @@ def build_paper(code: str, spec: dict, thumbnail_dir: Path | None) -> list[str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--thumbnail-dir",
-        type=Path,
-        help="Directory containing Quick Look PNGs named <figure>.svg.png.",
-    )
-    parser.add_argument(
-        "--papers",
-        nargs="+",
-        choices=tuple(PAPERS),
-        default=list(PAPERS),
-        help="Paper codes to build (default: all).",
-    )
-    args = parser.parse_args()
-    thumbnail_dir = args.thumbnail_dir.resolve() if args.thumbnail_dir else None
-
     manifest = [
         "# MarketScan publication tables and figures manifest",
         "",
@@ -258,9 +311,9 @@ def main() -> None:
         "This package is journal-agnostic. Final column width, font, and file-naming requirements should be checked against the selected journal before submission.",
         "",
     ]
-    for code in args.papers:
+    for code in PAPERS:
         spec = PAPERS[code]
-        manifest.extend(build_paper(code, spec, thumbnail_dir))
+        manifest.extend(build_paper(code, spec))
 
     output = ROOT / "04 Logs" / f"PUBLICATION_TABLES_FIGURES_MANIFEST_{DATE}.md"
     output.write_text("\n".join(manifest), encoding="utf-8")

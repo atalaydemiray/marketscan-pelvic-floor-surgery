@@ -13,17 +13,25 @@ from __future__ import annotations
 import csv
 import html
 import math
+import shutil
 from collections import defaultdict
 from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent
 PAPER = HERE.parent
-DATA = PAPER / "03 Data" / "Wu Comparable 2026-09-01"
-FIGURES = PAPER / "04 Figures" / "Wu Comparable 2026-09-01"
+PROJECT = PAPER.parent
+INPUT = PAPER / "03 Data" / "Wu Comparable 2026-09-01"
+DATA = PAPER / "03 Data" / "Analysis 2026-09-04"
+FIGURES = PAPER / "04 Figures" / "Analysis 2026-09-04"
+AUDIT = PROJECT / "04 Logs" / "Server Audit Aggregates 2026-09-04"
+DATA.mkdir(parents=True, exist_ok=True)
 FIGURES.mkdir(parents=True, exist_ok=True)
 
 QX_FILE = HERE / "nchs2019_female_qx.csv"
+# Source: Arias E, Xu JQ. United States Life Tables, 2019. National Vital
+# Statistics Reports. 2022;70(19), Table 3, female qx.
+# https://stacks.cdc.gov/view/cdc/231916
 DATABASES = ("CCAE", "MDCR")
 ENDPOINTS = {
     "SUI": "sui_operations",
@@ -83,7 +91,7 @@ def band_for(age: int) -> str:
 def pool_age() -> dict[int, dict[str, int]]:
     pooled: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for db in DATABASES:
-        for row in read_rows(DATA / f"{db}_wu_by_age.csv"):
+        for row in read_rows(INPUT / f"{db}_wu_by_age.csv"):
             age = as_int(row["age"])
             for field in ("person_years", "sui_operations", "pop_operations", "any_operations", "both_same_year"):
                 pooled[age][field] += as_int(row[field])
@@ -93,7 +101,7 @@ def pool_age() -> dict[int, dict[str, int]]:
 def pool_year_age() -> dict[tuple[int, int], dict[str, int]]:
     pooled: dict[tuple[int, int], dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for db in DATABASES:
-        for row in read_rows(DATA / f"{db}_wu_by_year_age.csv"):
+        for row in read_rows(INPUT / f"{db}_wu_by_year_age.csv"):
             key = (as_int(row["study_year"]), as_int(row["age"]))
             for field in ("person_years", "sui_operations", "pop_operations", "any_operations", "both_same_year"):
                 pooled[key][field] += as_int(row[field])
@@ -143,6 +151,152 @@ def lifetime_with_ci(age_data: dict[int, dict[str, int]], field: str, mu: dict[i
     se_logit = se / (estimate * (1.0 - estimate))
     logistic = lambda x: 1.0 / (1.0 + math.exp(-x))
     return estimate, logistic(logit - 1.959963984540054 * se_logit), logistic(logit + 1.959963984540054 * se_logit)
+
+
+def aggregate_years(
+    year_age: dict[tuple[int, int], dict[str, int]], years: set[int]
+) -> dict[int, dict[str, int]]:
+    result: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for (year, age), values in year_age.items():
+        if year not in years:
+            continue
+        for field, value in values.items():
+            result[age][field] += value
+    return dict(result)
+
+
+def wu_reestimated(endpoint: str, mu: dict[int, float]) -> tuple[float, float]:
+    probabilities = {}
+    for age in range(18, 90):
+        index = next(i for i, (lo, hi) in enumerate(WU_BANDS) if lo <= age <= hi)
+        probabilities[age] = WU_RATES[endpoint][index] / 1000.0
+    adjusted = cumulative_risk(probabilities, mu)
+    unadjusted = cumulative_risk(probabilities, {age: 0.0 for age in mu})
+    return adjusted, unadjusted
+
+
+def directly_standardized_annual_rates(
+    age_data: dict[int, dict[str, int]],
+    year_age: dict[tuple[int, int], dict[str, int]],
+) -> dict[int, dict[str, float]]:
+    total_py = sum(values["person_years"] for values in age_data.values())
+    weights = {age: values["person_years"] / total_py for age, values in age_data.items()}
+    result: dict[int, dict[str, float]] = defaultdict(dict)
+    years = sorted({year for year, _age in year_age})
+    for year in years:
+        for endpoint, field in ENDPOINTS.items():
+            result[year][endpoint] = 1000.0 * sum(
+                weights[age] * year_age[(year, age)][field] / year_age[(year, age)]["person_years"]
+                for age in weights
+            )
+    return dict(result)
+
+
+def make_sensitivity_tables(
+    age_data: dict[int, dict[str, int]],
+    year_age: dict[tuple[int, int], dict[str, int]],
+    mu: dict[int, float],
+) -> None:
+    eras = (
+        ("2014-2019", set(range(2014, 2020))),
+        ("2020-2021", {2020, 2021}),
+        ("2022-2024", {2022, 2023, 2024}),
+    )
+    era_rows = []
+    for label, years in eras:
+        era_age = aggregate_years(year_age, years)
+        for endpoint, field in ENDPOINTS.items():
+            estimate, lower, upper = lifetime_with_ci(era_age, field, mu)
+            era_rows.append({
+                "period": label,
+                "endpoint": endpoint,
+                "estimate_percent": f"{100 * estimate:.2f}",
+                "ci95_lower_percent": f"{100 * lower:.2f}",
+                "ci95_upper_percent": f"{100 * upper:.2f}",
+            })
+    write_rows(DATA / "Table5_period_specific_cumulative_risk.csv", era_rows, list(era_rows[0]))
+
+    base_probs = {
+        endpoint: {age: values[field] / values["person_years"] for age, values in age_data.items()}
+        for endpoint, field in ENDPOINTS.items()
+    }
+    sensitivity_rows = []
+    for endpoint in ("SUI", "POP", "Either"):
+        base = cumulative_risk(base_probs[endpoint], mu)
+        sensitivity_rows.append({
+            "endpoint": endpoint,
+            "specification": "Primary pooled 2014-2024 schedule",
+            "estimate_percent": f"{100 * base:.2f}",
+            "difference_from_primary_points": "0.00",
+        })
+
+        seam = dict(base_probs[endpoint])
+        for age in range(65, 69):
+            seam[age] = base_probs[endpoint][64] + (
+                base_probs[endpoint][69] - base_probs[endpoint][64]
+            ) * (age - 64) / 5.0
+        seam_value = cumulative_risk(seam, mu)
+        sensitivity_rows.append({
+            "endpoint": endpoint,
+            "specification": "Linear interpolation of ages 65-68 between ages 64 and 69",
+            "estimate_percent": f"{100 * seam_value:.2f}",
+            "difference_from_primary_points": f"{100 * (seam_value - base):+.2f}",
+        })
+
+        aligned = {
+            age: 0.5 * (base_probs[endpoint][age] + base_probs[endpoint].get(age + 1, base_probs[endpoint][age]))
+            for age in base_probs[endpoint]
+        }
+        aligned_value = cumulative_risk(aligned, mu)
+        sensitivity_rows.append({
+            "endpoint": endpoint,
+            "specification": "Half-year age alignment sensitivity",
+            "estimate_percent": f"{100 * aligned_value:.2f}",
+            "difference_from_primary_points": f"{100 * (aligned_value - base):+.2f}",
+        })
+
+        mortality_85 = cumulative_risk(base_probs[endpoint], {age: 0.85 * value for age, value in mu.items()})
+        sensitivity_rows.append({
+            "endpoint": endpoint,
+            "specification": "Mortality hazards scaled to 85% of US female life table",
+            "estimate_percent": f"{100 * mortality_85:.2f}",
+            "difference_from_primary_points": f"{100 * (mortality_85 - base):+.2f}",
+        })
+
+    no_bulking_path = AUDIT / "p01_no_bulking_lifetime_risk.csv"
+    if no_bulking_path.exists():
+        for row in read_rows(no_bulking_path):
+            endpoint = "SUI" if row["endpoint"].startswith("SUI") else "Either"
+            value = float(row["cumulative_risk_percent"]) / 100.0
+            base = cumulative_risk(base_probs[endpoint], mu)
+            sensitivity_rows.append({
+                "endpoint": endpoint,
+                "specification": "Exclude urethral bulking (CPT 51715)",
+                "estimate_percent": f"{100 * value:.2f}",
+                "difference_from_primary_points": f"{100 * (value - base):+.2f}",
+            })
+    write_rows(DATA / "Table6_deterministic_sensitivity_analysis.csv", sensitivity_rows, list(sensitivity_rows[0]))
+
+    washout_rows = []
+    for years in (1, 3, 5, 7, 10):
+        washout_age: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for database in DATABASES:
+            for row in read_rows(PAPER / "03 Data" / f"{database}_washout{years:02d}.csv"):
+                year = as_int(row["study_year"])
+                age = as_int(row["age_at_index"])
+                if 2014 <= year <= 2024 and 18 <= age <= 89:
+                    washout_age[age]["person_years"] += as_int(row["py"])
+                    washout_age[age]["any_operations"] += as_int(row["n_union"])
+        estimate, lower, upper = lifetime_with_ci(washout_age, "any_operations", mu)
+        washout_rows.append({
+            "washout_years": years,
+            "woman_years": sum(row["person_years"] for row in washout_age.values()),
+            "qualifying_operation_person_years": sum(row["any_operations"] for row in washout_age.values()),
+            "either_estimate_percent": f"{100 * estimate:.2f}",
+            "ci95_lower_percent": f"{100 * lower:.2f}",
+            "ci95_upper_percent": f"{100 * upper:.2f}",
+        })
+    write_rows(DATA / "Table7_washout_sensitivity.csv", washout_rows, list(washout_rows[0]))
 
 
 def make_tables(age_data: dict[int, dict[str, int]], year_age: dict[tuple[int, int], dict[str, int]], mu: dict[int, float]) -> None:
@@ -196,13 +350,16 @@ def make_tables(age_data: dict[int, dict[str, int]], year_age: dict[tuple[int, i
     table3 = []
     for endpoint, field in ENDPOINTS.items():
         estimate, lower, upper = lifetime_with_ci(age_data, field, mu)
+        wu_adjusted, wu_unadjusted = wu_reestimated(endpoint, mu)
         table3.append({
             "endpoint": endpoint,
             "current_estimate_percent": f"{100.0 * estimate:.2f}",
             "ci95_lower_percent": f"{100.0 * lower:.2f}",
             "ci95_upper_percent": f"{100.0 * upper:.2f}",
-            "wu_2007_2011_percent": f"{WU_LIFETIME[endpoint]:.1f}",
-            "absolute_difference_percentage_points": f"{100.0 * estimate - WU_LIFETIME[endpoint]:.2f}",
+            "wu_published_percent": f"{WU_LIFETIME[endpoint]:.1f}",
+            "wu_rates_current_recursion_percent": f"{100.0 * wu_adjusted:.2f}",
+            "wu_rates_without_mortality_percent": f"{100.0 * wu_unadjusted:.2f}",
+            "like_for_like_difference_points": f"{100.0 * (estimate - wu_adjusted):.2f}",
         })
     write_rows(DATA / "Table3_lifetime_risk.csv", table3, list(table3[0]))
 
@@ -210,6 +367,7 @@ def make_tables(age_data: dict[int, dict[str, int]], year_age: dict[tuple[int, i
     for (year, _age), values in year_age.items():
         for field, value in values.items():
             annual[year][field] += value
+    standardized = directly_standardized_annual_rates(age_data, year_age)
     table4 = []
     for year in sorted(annual):
         values = annual[year]
@@ -217,8 +375,10 @@ def make_tables(age_data: dict[int, dict[str, int]], year_age: dict[tuple[int, i
         for endpoint, field in ENDPOINTS.items():
             row[f"{endpoint.lower()}_operations"] = values[field]
             row[f"{endpoint.lower()}_rate_per_1000"] = f"{1000.0 * values[field] / values['person_years']:.3f}"
+            row[f"{endpoint.lower()}_age_standardized_rate_per_1000"] = f"{standardized[year][endpoint]:.3f}"
         table4.append(row)
     write_rows(DATA / "Table4_annual_crude_rates.csv", table4, list(table4[0]))
+    make_sensitivity_tables(age_data, year_age, mu)
 
 
 def make_figures() -> None:
@@ -324,12 +484,12 @@ def make_figures() -> None:
 
 
 def write_summary() -> None:
-    totals = [r for r in read_rows(DATA / "P01_wu_totals.csv") if r["database"] == "Pooled"][0]
+    totals = [r for r in read_rows(INPUT / "P01_wu_totals.csv") if r["database"] == "Pooled"][0]
     lifetime = read_rows(DATA / "Table3_lifetime_risk.csv")
     lookup = {r["endpoint"]: r for r in lifetime}
     lines = [
         "P01 Wu-comparable rerun summary",
-        "Run date: 2026-09-02",
+        "Run date: 2026-09-04",
         "",
         f"Eligible woman-years: {as_int(totals['person_years']):,}",
         f"Qualifying operation-person-years: {as_int(totals['any_operations']):,}",
@@ -346,7 +506,8 @@ def write_summary() -> None:
         lines.append(
             f"- {endpoint}: {row['current_estimate_percent']}% "
             f"(95% CI {row['ci95_lower_percent']}-{row['ci95_upper_percent']}%); "
-            f"Wu et al. {row['wu_2007_2011_percent']}%"
+            f"Wu et al. published {row['wu_published_percent']}%; "
+            f"Wu age-band rates under the current recursion {row['wu_rates_current_recursion_percent']}%"
         )
     lines.extend((
         "",
@@ -356,6 +517,7 @@ def write_summary() -> None:
 
 
 def main() -> None:
+    shutil.copy2(INPUT / "P01_wu_totals.csv", DATA / "P01_wu_totals.csv")
     age_data = pool_age()
     year_age = pool_year_age()
     mu = mortality_hazards()
@@ -363,9 +525,10 @@ def main() -> None:
     make_figures()
     write_summary()
 
-    totals = [r for r in read_rows(DATA / "P01_wu_totals.csv") if r["database"] == "Pooled"][0]
-    assert as_int(totals["person_years"]) > 0
-    assert as_int(totals["any_operations"]) >= as_int(totals["unique_operated_women"])
+    totals = [r for r in read_rows(INPUT / "P01_wu_totals.csv") if r["database"] == "Pooled"][0]
+    assert as_int(totals["person_years"]) == 47_258_198
+    assert as_int(totals["any_operations"]) == 102_440
+    assert as_int(totals["unique_operated_women"]) == 102_107
     print((DATA / "P01_wu_summary.txt").read_text())
 
 

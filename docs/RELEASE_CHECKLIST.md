@@ -8,7 +8,7 @@
       cleared for release.
 - [ ] All cells in any cleared aggregate output satisfy the disclosure rule, and suppressed values
       cannot be reconstructed by subtraction.
-- [ ] Public mortality input has a complete source citation.
+- [ ] Public mortality and CPT lifecycle inputs have complete source citations.
 - [ ] Dependency versions and exact run order are documented.
 - [ ] CI passes on the release commit.
 - [ ] Citation metadata and an approved open-source license are added.

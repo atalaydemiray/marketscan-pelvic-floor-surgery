@@ -1,7 +1,7 @@
 # P03 server-side aggregate analysis
 #
-# Governance: Atalay confirmed on 1 September 2026 that this follow-up scope
-# had already been cleared with DataMed/Yujia. Row-level data remain on server.
+# Row-level data remain on the licensed Yale server. Only disclosure-screened
+# aggregate outputs may be transferred.
 
 library(duckdb)
 library(DBI)
@@ -52,19 +52,26 @@ dbExecute(con, sprintf("CREATE OR REPLACE TEMP VIEW surgery_all AS
   UNION ALL
   SELECT 'MDCR' AS database, * FROM %s", se_ccae, se_mdcr))
 
+dbExecute(con, "CREATE OR REPLACE TEMP VIEW surgery_dedup AS
+  SELECT ENROLID, CAST(svcdate AS DATE) AS svcdate,
+         YEAR(CAST(svcdate AS DATE)) AS svc_year,
+         CASE WHEN COUNT(DISTINCT database)=1 THEN MIN(database) ELSE 'BOTH' END AS event_database,
+         list_distinct(flatten(list(codes))) AS codes,
+         MAX(is_pop_surgery) AS is_pop_surgery
+  FROM surgery_all
+  GROUP BY ENROLID, CAST(svcdate AS DATE)")
+
 dbExecute(con, "CREATE OR REPLACE TEMP VIEW p03_episodes AS
   WITH dates AS (
-    SELECT s.ENROLID, CAST(s.svcdate AS DATE) AS svcdate,
-           MIN(e.study_year) AS study_year, MIN(e.age_at_index) AS age_at_index,
-           MIN(e.age5) AS age5,
-           CASE WHEN COUNT(DISTINCT s.database)=1 THEN MIN(s.database) ELSE 'BOTH' END AS event_database,
+    SELECT s.ENROLID, s.svcdate, e.study_year, e.age_at_index, e.age5,
+           s.event_database,
            MAX(CASE WHEN list_contains(s.codes, '57288') THEN 1 ELSE 0 END) AS has_sling,
            MAX(CASE WHEN list_contains(s.codes, '51715') THEN 1 ELSE 0 END) AS has_bulking,
            MAX(CASE WHEN s.is_pop_surgery=1 THEN 1 ELSE 0 END) AS pop_same_day
-    FROM surgery_all s
+    FROM surgery_dedup s
     INNER JOIN eligible_keys e
-      ON s.ENROLID=e.ENROLID AND CAST(s.YEAR AS INTEGER)=e.study_year
-    GROUP BY s.ENROLID, CAST(s.svcdate AS DATE)
+      ON s.ENROLID=e.ENROLID AND s.svc_year=e.study_year
+    GROUP BY s.ENROLID,s.svcdate,e.study_year,e.age_at_index,e.age5,s.event_database
     HAVING MAX(CASE WHEN list_contains(s.codes, '57288') OR list_contains(s.codes, '51715')
                     THEN 1 ELSE 0 END)=1
   )
@@ -81,12 +88,49 @@ dbExecute(con, "CREATE OR REPLACE TEMP VIEW p03_first AS
     FROM p03_episodes
   ) WHERE rn=1")
 
+# The secondary burden estimand follows all 2014-2024 sling/bulking dates
+# visible for women who contributed at least one eligible woman-year. It is not
+# restricted to eligible years and is therefore reported as counts/shares, not
+# as a rate over the parent woman-year denominator.
+dbExecute(con, "CREATE OR REPLACE TEMP VIEW ever_eligible AS
+  SELECT ENROLID, MIN(age_at_index-study_year) AS birth_offset
+  FROM eligible_keys GROUP BY ENROLID")
+
+dbExecute(con, "CREATE OR REPLACE TEMP VIEW p03_period_episodes AS
+  SELECT s.ENROLID,s.svcdate,s.svc_year AS study_year,
+         s.svc_year + e.birth_offset AS age_at_index,
+         CASE WHEN s.svc_year + e.birth_offset<30 THEN '18-29'
+              WHEN s.svc_year + e.birth_offset<35 THEN '30-34'
+              WHEN s.svc_year + e.birth_offset<40 THEN '35-39'
+              WHEN s.svc_year + e.birth_offset<45 THEN '40-44'
+              WHEN s.svc_year + e.birth_offset<50 THEN '45-49'
+              WHEN s.svc_year + e.birth_offset<55 THEN '50-54'
+              WHEN s.svc_year + e.birth_offset<60 THEN '55-59'
+              WHEN s.svc_year + e.birth_offset<65 THEN '60-64'
+              WHEN s.svc_year + e.birth_offset<70 THEN '65-69'
+              WHEN s.svc_year + e.birth_offset<75 THEN '70-74'
+              WHEN s.svc_year + e.birth_offset<80 THEN '75-79'
+              WHEN s.svc_year + e.birth_offset<85 THEN '80-84' ELSE '85-89' END AS age_publication,
+         CASE WHEN list_contains(s.codes,'57288') AND list_contains(s.codes,'51715') THEN 'Hybrid'
+              WHEN list_contains(s.codes,'57288') THEN 'Sling' ELSE 'Bulking' END AS procedure_category,
+         CASE WHEN s.is_pop_surgery=1 THEN 'Concomitant POP' ELSE 'Isolated SUI' END AS pop_context
+  FROM surgery_dedup s INNER JOIN ever_eligible e USING (ENROLID)
+  WHERE s.svc_year BETWEEN 2014 AND 2024
+    AND s.svc_year + e.birth_offset BETWEEN 18 AND 89
+    AND (list_contains(s.codes,'57288') OR list_contains(s.codes,'51715'))")
+
+dbExecute(con, "CREATE OR REPLACE TEMP VIEW p03_first_period AS
+  SELECT * EXCLUDE(rn) FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY ENROLID ORDER BY svcdate) AS rn
+    FROM p03_period_episodes
+  ) WHERE rn=1")
+
 make_burden <- function(window_days) {
   view_name <- sprintf("p03_burden_%03d", window_days)
   dbExecute(con, sprintf("CREATE OR REPLACE TEMP VIEW %s AS
     WITH bulking_lag AS (
       SELECT *, LAG(svcdate) OVER (PARTITION BY ENROLID ORDER BY svcdate) AS prior_bulking_date
-      FROM p03_episodes WHERE procedure_category='Bulking'
+      FROM p03_period_episodes WHERE procedure_category='Bulking'
     ),
     bulking_marked AS (
       SELECT *, CASE WHEN prior_bulking_date IS NULL
@@ -104,17 +148,18 @@ make_burden <- function(window_days) {
       SELECT ENROLID, MIN(svcdate) AS svcdate,
              ARG_MIN(study_year, svcdate) AS study_year,
              ARG_MIN(age_at_index, svcdate) AS age_at_index,
-             ARG_MIN(age5, svcdate) AS age5,
-             CASE WHEN MAX(pop_same_day)=1 THEN 'Concomitant POP' ELSE 'Isolated SUI' END AS pop_context,
+             ARG_MIN(age_publication, svcdate) AS age5,
+             CASE WHEN MAX(CASE WHEN pop_context='Concomitant POP' THEN 1 ELSE 0 END)=1
+                  THEN 'Concomitant POP' ELSE 'Isolated SUI' END AS pop_context,
              'Bulking course' AS burden_category,
              COUNT(*) AS injections_in_course
       FROM bulking_numbered GROUP BY ENROLID, course_id
     ),
     nonbulking AS (
-      SELECT ENROLID, svcdate, study_year, age_at_index, age5, pop_context,
+      SELECT ENROLID, svcdate, study_year, age_at_index, age_publication AS age5, pop_context,
              CASE WHEN procedure_category='Sling' THEN 'Sling episode' ELSE 'Hybrid episode' END AS burden_category,
              1 AS injections_in_course
-      FROM p03_episodes WHERE procedure_category IN ('Sling', 'Hybrid')
+      FROM p03_period_episodes WHERE procedure_category IN ('Sling', 'Hybrid')
     )
     SELECT * FROM bulking_courses UNION ALL SELECT * FROM nonbulking",
     view_name, window_days))
@@ -130,12 +175,20 @@ outputs <- list(
                        FROM p03_first GROUP BY 1,2,3,4 ORDER BY 1,2,3,4",
   first_by_period_age = "SELECT study_period, age5, pop_context, procedure_category, COUNT(*) AS women
                          FROM p03_first GROUP BY 1,2,3,4 ORDER BY 1,2,3,4",
+  first_by_period_age_publication = "SELECT study_period,
+      CASE WHEN age_at_index<30 THEN '18-29' ELSE age5 END AS age_publication,
+      pop_context, procedure_category, COUNT(*) AS women
+    FROM p03_first GROUP BY 1,2,3,4 ORDER BY 1,2,3,4",
   first_by_period = "SELECT study_period, pop_context, procedure_category, COUNT(*) AS women
                      FROM p03_first GROUP BY 1,2,3 ORDER BY 1,2,3",
   first_by_database = "SELECT event_database, pop_context, procedure_category, COUNT(*) AS women
                        FROM p03_first GROUP BY 1,2,3 ORDER BY 1,2,3",
   first_totals = "SELECT pop_context, procedure_category, COUNT(*) AS women
-                  FROM p03_first GROUP BY 1,2 ORDER BY 1,2"
+                  FROM p03_first GROUP BY 1,2 ORDER BY 1,2",
+  first_period_sensitivity = "SELECT
+      CASE WHEN study_year<=2019 THEN '2014-2019' ELSE '2020-2024' END AS study_period,
+      pop_context,procedure_category,COUNT(*) AS women
+    FROM p03_first_period GROUP BY 1,2,3 ORDER BY 1,2,3"
 )
 
 for (name in names(outputs)) {
@@ -168,13 +221,25 @@ for (window_days in c(90L, 180L)) {
 }
 
 denominator_total <- dbGetQuery(con, "SELECT COUNT(*) AS n FROM eligible_rows")$n
-stopifnot(denominator_total > 0)
+stopifnot(denominator_total == 47258198)
+stopifnot(dbGetQuery(con, "SELECT COUNT(*) AS n FROM p03_first")$n == 56257)
+stopifnot(dbGetQuery(con, "SELECT COUNT(*) AS n FROM p03_burden_090
+                           WHERE pop_context='Isolated SUI'
+                             AND burden_category='Sling episode'")$n == 33845)
+stopifnot(dbGetQuery(con, "SELECT COUNT(*) AS n FROM p03_burden_090
+                           WHERE pop_context='Isolated SUI'
+                             AND burden_category='Bulking course'")$n == 7476)
+stopifnot(dbGetQuery(con, "SELECT COUNT(*) AS n FROM p03_burden_180
+                           WHERE pop_context='Isolated SUI'
+                             AND burden_category='Bulking course'")$n == 7135)
 
 writeLines(c(
   sprintf("Run time UTC: %s", format(Sys.time(), tz = "UTC")),
-  "P03 server-side aggregation completed within the confirmed follow-up scope.",
-  "First observed procedure and bulking courses were resolved globally across CCAE and MDCR.",
-  sprintf("Pooled person-year denominator is nonzero: %s.", format(denominator_total, big.mark=",", scientific=FALSE)),
+  "P03 server-side aggregation completed.",
+  "First qualifying procedure within an eligible woman-year was resolved globally across CCAE and MDCR.",
+  "Annual attribution used service-date year; the source claim YEAR field was not used for the event join.",
+  "Secondary burden courses used all observed 2014-2024 events among ever-eligible women.",
+  "Locked Wu-style pooled person-year denominator check passed: 47,258,198.",
   "Primary bulking-course window: 90 days; sensitivity: 180 days.",
   "Review all cells for disclosure safety before transferring aggregate files."
 ), file.path(OUT, "P03_run_log.txt"))

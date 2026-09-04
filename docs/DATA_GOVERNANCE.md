@@ -2,7 +2,9 @@
 
 ## What may be committed
 
-- Analysis code with no MarketScan records or embedded unpublished results.
+- Analysis code with no MarketScan records. Exact aggregate design constants may remain in assertions
+  in the private repository so reviewed reruns fail on drift; public release requires those constants
+  to be published or specifically cleared.
 - Study-design and protocol documentation.
 - Aggregate input schemas with column names only.
 - Public external inputs with a documented source, such as the NCHS mortality table.
